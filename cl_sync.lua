@@ -95,7 +95,7 @@ function READER:BackupData()
 	local data = self:GetReaderDataForSync()
 
 	-- Iterate through the front and rear camera
-	for cam in UTIL:Values( { "front", "rear" } ) do
+	for _, cam in ipairs( UTIL.ANTS ) do
 		-- Check that there isn't already backup data, then if not, back up the player's data
 		if ( self:GetBackupReaderData( cam ) == nil ) then
 			self:SetBackupReaderData( cam, data[cam] )
@@ -111,7 +111,7 @@ function READER:LoadDataFromDriver( data )
 	-- As a precaution, give the system 50ms before it replaces the local data with the data from the driver
 	Citizen.SetTimeout( 50, function()
 		-- Set the camera data
-		for cam in UTIL:Values( { "front", "rear" } ) do
+		for _, cam in ipairs( UTIL.ANTS ) do
 			self:SetReaderCamData( cam, data[cam] )
 		end
 
@@ -123,7 +123,7 @@ end
 -- Restores the backed up plate reader data
 function READER:RestoreFromBackup()
 	-- Iterate through the cameras and restore their backups
-	for cam in UTIL:Values( { "front", "rear" } ) do
+	for _, cam in ipairs( UTIL.ANTS ) do
 		RestoreData( READER, READER.GetBackupReaderData, READER.SetReaderCamData, READER.SetBackupReaderData, cam )
 	end
 
@@ -209,7 +209,7 @@ function RADAR:BackupData()
 	-- get reset when they turn the power on anyway
 	if ( data.power ) then
 		-- Backup front and rear antenna data
-		for ant in UTIL:Values( { "front", "rear" } ) do
+		for _, ant in ipairs( UTIL.ANTS ) do
 			if ( self:GetBackupAntennaData( ant ) == nil ) then
 				self:SetBackupAntennaData( ant, data[ant] )
 			end
@@ -228,7 +228,7 @@ function RADAR:LoadDataFromDriver( data )
 		self:SetOMTableData( data.om )
 
 		-- Set the antenna data
-		for ant in UTIL:Values( { "front", "rear" } ) do
+		for _, ant in ipairs( UTIL.ANTS ) do
 			self:SetAntennaTableData( ant, data[ant] )
 		end
 
@@ -248,7 +248,7 @@ function RADAR:RestoreFromBackup()
 	RestoreData( RADAR, RADAR.GetBackupOMData, RADAR.SetOMTableData, RADAR.SetBackupOMData )
 
 	-- Iterate through the antennas and restore their backups
-	for ant in UTIL:Values( { "front", "rear" } ) do
+	for _, ant in ipairs( UTIL.ANTS ) do
 		RestoreData( RADAR, RADAR.GetBackupAntennaData, RADAR.SetAntennaTableData, RADAR.SetBackupAntennaData, ant )
 	end
 

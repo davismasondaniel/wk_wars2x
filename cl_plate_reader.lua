@@ -171,7 +171,7 @@ end
 
 -- Forces an NUI update, used by the passenger control system
 function READER:ForceNUIUpdate( lock )
-	for cam in UTIL:Values( { "front", "rear" } ) do
+	for _, cam in ipairs( UTIL.ANTS ) do
 		local plate = self:GetPlate( cam )
 		local index = self:GetIndex( cam )
 
@@ -233,9 +233,6 @@ function READER:Main()
 	if ( PLY:VehicleStateValid() and self:CanPerformMainTask() ) then
 		-- Loop through front (1) and rear (-1)
 		for i = 1, -1, -2 do
-			-- Get the world position of the player's vehicle
-			local pos = GetEntityCoords( PLY.veh )
-
 			-- Get a start position 5m in front/behind the player's vehicle
 			local start = GetOffsetFromEntityInWorldCoords( PLY.veh, 0.0, ( 5.0 * i ), 0.0 )
 
@@ -297,13 +294,13 @@ function READER:Main()
 end
 
 -- Main thread
-Citizen.CreateThread( function()
+CreateThread( function()
 	while ( true ) do
 		-- Run the main plate reader function
 		READER:Main()
 
 		-- Wait half a second
-		Citizen.Wait( 500 )
+		Wait( 500 )
 	end
 end )
 
@@ -321,14 +318,14 @@ function READER:RunDisplayValidationCheck()
 end
 
 -- Runs the display validation check for the radar
-Citizen.CreateThread( function()
-	Citizen.Wait( 100 )
+CreateThread( function()
+	Wait( 100 )
 
 	while ( true ) do
 		-- Run the check
 		READER:RunDisplayValidationCheck()
 
 		-- Wait half a second
-		Citizen.Wait( 500 )
+		Wait( 500 )
 	end
 end )

@@ -141,6 +141,18 @@ end
 	NOTE - This is not a config, do not touch anything unless you know what
 	you are actually doing.
 ----------------------------------------------------------------------------------]]--
+-- NUI "update" de-duplication. The radar used to push a full update message to the NUI every 100ms even when
+-- nothing on screen had changed. Any other NUI message sent from this file invalidates the cache (so displays are
+-- always re-sent after power, menu, lock etc.), and a heartbeat resends at least once a second.
+local RawSendNUIMessage = SendNUIMessage
+local lastUpdateSig = nil
+local lastUpdateTime = 0
+
+local function SendNUIMessage( msg )
+	lastUpdateSig = nil
+	RawSendNUIMessage( msg )
+end
+
 RADAR = {}
 RADAR.vars =
 {
@@ -374,7 +386,7 @@ function RADAR:SendSettingUpdate()
 	local antennas = {}
 
 	-- Iterate through each antenna and grab the relevant information
-	for ant in UTIL:Values( { "front", "rear" } ) do
+	for _, ant in ipairs( UTIL.ANTS ) do
 		antennas[ant] = {}
 		antennas[ant].xmit = self:IsAntennaTransmitting( ant )
 		antennas[ant].mode = self:GetAntennaMode( ant )
@@ -823,9 +835,9 @@ end
 
 -- This function is used to check if the target vehicle is in the same general traffic flow as the player's vehicle
 -- is sitting. If the angle is too great, then the radar would have an incorrect return for the speed.
-function RADAR:IsVehicleInTraffic( tgtVeh, relPos )
+function RADAR:IsVehicleInTraffic( tgtVeh, relPos, plyHdg )
 	local tgtHdg = GetEntityHeading( tgtVeh )
-	local plyHdg = GetEntityHeading( PLY.veh )
+	plyHdg = plyHdg or GetEntityHeading( PLY.veh )
 
 	-- Work out the heading difference, but also take into account extreme opposites (e.g. 5deg and 350deg)
 	local hdgDiff = math.abs( ( plyHdg - tgtHdg + 180 ) % 360 - 180 )
@@ -839,109 +851,109 @@ function RADAR:IsVehicleInTraffic( tgtVeh, relPos )
 	return true
 end
 
--- This function is the main custom ray trace function, it performs most of the major tasks for checking a vehicle
--- is valid and should be tested. It also makes use of the LOS native to make sure that we can only trace a vehicle
--- if actually nas a direct line of sight with the player's vehicle, this way we don't pick up vehicles behind walls
--- for example. It then creates a dynamic sphere for the vehicle based on the actual model dimensions of it, adds a
--- small bit of realism, as real radars usually return the strongest target speed.
-function RADAR:ShootCustomRay( plyVeh, veh, s, e )
-	-- Get the world coordinates of the target vehicle
-	local pos = GetEntityCoords( veh )
+-- Builds the list of vehicles that can possibly be picked up this scan. Everything that doesn't depend on the
+-- individual ray (position, speed, sphere size) is fetched once here instead of once per ray per vehicle.
+function RADAR:BuildScanCandidates( ownVeh, vehicles )
+	local cands, n = {}, 0
+	local limit = self:GetMaxCheckDist() + 25.0
+	local ownPos = GetEntityCoords( ownVeh )
 
-	-- Calculate the distance between the target vehicle and the start point of the ray trace, note how we don't
-	-- use GetDistanceBetweenCoords or Vdist, the method below still returns the same result with less cpu time
-	local dist = #( pos - s )
+	for i = 1, #vehicles do
+		local veh = vehicles[i]
 
-	-- We only perform a trace on the target vehicle if it exists, isn't the player's vehicle, and the distance is
-	-- less than the max distance defined by the system
-	if ( DoesEntityExist( veh ) and veh ~= plyVeh and dist < self:GetMaxCheckDist() ) then
-		-- Get the speed of the target vehicle
-		local entSpeed = GetEntitySpeed( veh )
+		if ( veh ~= ownVeh and DoesEntityExist( veh ) ) then
+			local pos = GetEntityCoords( veh )
 
-		-- Check that the target vehicle is within the line of sight of the player's vehicle
-		local visible = HasEntityClearLosToEntity( plyVeh, veh, 15 ) -- 13 seems okay, 15 too (doesn't grab ents through ents)
+			-- Ray start points are at most ~17m from the player's vehicle, so anything further than the max check
+			-- distance plus a margin can never be hit
+			if ( #( pos - ownPos ) < limit ) then
+				local speed = GetEntitySpeed( veh )
 
-		-- Get the pitch of the player's vehicle
-		local pitch = GetEntityPitch( plyVeh )
-
-		-- Now we check that the target vehicle is moving and is visible
-		if ( entSpeed > 0.1 and ( pitch > -35 and pitch < 35 ) and visible ) then
-			-- Get the dynamic radius as well as the size of the target vehicle
-			local radius, size = self:GetDynamicRadius( veh )
-
-			-- Check that the trace line intersects with the target vehicle's sphere
-			local hit, relPos = self:GetLineHitsSphereAndDir( pos, radius, s, e )
-
-			-- Return all of the information if the vehicle was hit and is in the flow of traffic
-			if ( hit and self:IsVehicleInTraffic( veh, relPos ) ) then
-				return true, relPos, dist, entSpeed, size
+				-- Stationary vehicles are never returned by the radar
+				if ( speed > 0.1 ) then
+					local radius, size = self:GetDynamicRadius( veh )
+					n = n + 1
+					cands[n] = { veh = veh, x = pos.x, y = pos.y, z = pos.z, speed = speed, radius = radius, size = size, visible = nil }
+				end
 			end
 		end
 	end
 
-	-- Return a whole lot of nothing
-	return false, nil, nil, nil, nil
+	return cands
 end
 
--- This function is used to gather all of the data on vehicles that have been hit by the given trace line, when
--- a vehicle is hit, all of the information about that vehicle is put into a keyless table which is then inserted
--- into a main table. When the loop has finished, the function then returns the table with all of the data.
-function RADAR:GetVehsHitByRay( ownVeh, vehs, s, e )
-	-- Create the table that will be used to store all of the results
-	local caughtVehs = {}
+-- Gathers all of the candidate vehicles hit by the given trace line. The line/sphere maths is done with plain
+-- numbers (no vector allocations), and the expensive line of sight native is only called for vehicles that have
+-- actually been hit, and at most once per vehicle per scan.
+function RADAR:GetVehsHitByRay( ownVeh, cands, s, e, plyHdg )
+	local sx, sy, sz = s.x, s.y, s.z
+	local dx, dy = e.x - sx, e.y - sy
+	local rayDist = math.sqrt( dx * dx + dy * dy )
 
-	-- Set the variable to say if there has been data collected
-	local hasData = false
+	if ( rayDist == 0.0 ) then return nil end
 
-	-- Iterate through all of the vehicles
-	for _, veh in pairs( vehs ) do
-		-- Shoot a custom ray trace to see if the vehicle gets hit
-		local hit, relativePos, distance, speed, size = self:ShootCustomRay( ownVeh, veh, s, e )
+	local nx, ny = dx / rayDist, dy / rayDist
+	local maxDist = self:GetMaxCheckDist()
+	local maxDistSqr = maxDist * maxDist
+	local caught, count = nil, 0
 
-		-- If the vehicle is hit, then we create a table containing all of the information
-		if ( hit ) then
-			-- Create the table to store the data
-			local vehData = {}
-			vehData.veh = veh
-			vehData.relPos = relativePos
-			vehData.dist = distance
-			vehData.speed = speed
-			vehData.size = size
+	for i = 1, #cands do
+		local c = cands[i]
+		local rx, ry = c.x - sx, c.y - sy
+		local flatSqr = rx * rx + ry * ry
+		local rz = c.z - sz
 
-			-- Insert the table into the caught vehicles table
-			table.insert( caughtVehs, vehData )
+		if ( flatSqr + rz * rz < maxDistSqr ) then
+			local t = rx * nx + ry * ny
+			local radius = c.radius
 
-			-- Change the has data variable to true, this way the table will be returned
-			hasData = true
+			-- Shortest distance from the vehicle's centre to the ray, and the same range check as before
+			if ( flatSqr - t * t < radius * radius and not ( math.sqrt( flatSqr ) - radius * 2 > rayDist ) ) then
+				local relPos = self:GetIntersectedVehIsFrontOrRear( t )
+
+				if ( self:IsVehicleInTraffic( c.veh, relPos, plyHdg ) ) then
+					if ( c.visible == nil ) then
+						c.visible = HasEntityClearLosToEntity( ownVeh, c.veh, 15 )
+					end
+
+					if ( c.visible ) then
+						if ( caught == nil ) then caught = {} end
+						count = count + 1
+						caught[count] = { veh = c.veh, relPos = relPos, dist = math.sqrt( flatSqr + rz * rz ), speed = c.speed, size = c.size }
+					end
+				end
+			end
 		end
 	end
 
-	-- If the caughtVehs table actually has data, then return it
-	if ( hasData ) then return caughtVehs end
+	return caught
 end
 
--- This function is used to gather all of the vehicles hit by a given line trace, and then insert it into the
+-- This function gathers all of the vehicles hit by a given line trace, and then inserts it into the
 -- internal captured vehicles table.
-function RADAR:CreateRayThread( vehs, from, startX, endX, endY, rayType )
+function RADAR:CreateRayThread( cands, from, startX, endX, endY, rayType, plyHdg )
 	-- Get the start and end points for the ray trace based on the given start and end coordinates
 	local startPoint = GetOffsetFromEntityInWorldCoords( from, startX, 0.0, 0.0 )
 	local endPoint = GetOffsetFromEntityInWorldCoords( from, endX, endY, 0.0 )
 
-	-- Get all of the vehicles hit by the ray
-	local hitVehs = self:GetVehsHitByRay( from, vehs, startPoint, endPoint )
-
 	-- Insert the captured vehicle data and pass the ray type too
-	self:InsertCapturedVehicleData( hitVehs, rayType )
-
-	-- Increase the ray trace state
-	self:IncreaseRayTraceState()
+	self:InsertCapturedVehicleData( self:GetVehsHitByRay( from, cands, startPoint, endPoint, plyHdg ), rayType )
 end
 
--- This function iterates through each of the traces defined in RADAR.rayTraces and creates a 'thread' for
--- them, passing along all of the vehicle pool data and the player's vehicle
+-- This function iterates through each of the traces defined in RADAR.rayTraces and runs them against the
+-- candidate vehicles for this scan
 function RADAR:CreateRayThreads( ownVeh, vehicles )
-	for _, v in pairs( self.rayTraces ) do
-		self:CreateRayThread( vehicles, ownVeh, v.startVec.x, v.endVec.x, v.endVec.y, v.rayType )
+	-- If the patrol vehicle is pitched too far, no ray can hit anything, so skip the whole scan
+	local pitch = GetEntityPitch( ownVeh )
+	if ( pitch <= -35.0 or pitch >= 35.0 ) then return end
+
+	local cands = self:BuildScanCandidates( ownVeh, vehicles )
+	if ( #cands == 0 ) then return end
+
+	local plyHdg = GetEntityHeading( ownVeh )
+
+	for _, v in ipairs( self.rayTraces ) do
+		self:CreateRayThread( cands, ownVeh, v.startVec.x, v.endVec.x, v.endVec.y, v.rayType, plyHdg )
 	end
 end
 
@@ -1278,21 +1290,14 @@ end
 -- This function is used to get the dynamic sphere data for a vehicle, if data already exists for the
 -- given vehicle, then the system just returns the already made data, otherwise the data gets created
 function RADAR:GetDynamicRadius( veh )
-	-- Get the model of the vehicle
+	-- The model hash is used directly as the cache key, no string conversion needed
 	local mdl = GetEntityModel( veh )
-
-	-- Create a key based on the model
-	local key = tostring( mdl )
-
-	-- Check to see if data already exists
-	local dataExists = self:DoesDynamicRadiusDataExist( key )
+	local data = self.vars.sphereSizes[mdl]
 
 	-- If the data doesn't already exist, then we create it
-	if ( not dataExists ) then
+	if ( data == nil ) then
 		-- Get the min and max points of the vehicle model
 		local min, max = GetModelDimensions( mdl )
-
-		-- Calculate the size, as the min value is negative
 		local size = max - min
 
 		-- Get a numeric size which composes of the x, y, and z size combined
@@ -1301,15 +1306,11 @@ function RADAR:GetDynamicRadius( veh )
 		-- Get a dynamic radius for the given vehicle model that fits into the world of GTA
 		local dynamicRadius = UTIL:Clamp( ( numericSize * numericSize ) / 12, 5.0, 11.0 )
 
-		-- Insert the newly created sphere data into the sphere data table
-		self:InsertDynamicRadiusData( key, dynamicRadius, numericSize )
-
-		-- Return the data
-		return dynamicRadius, numericSize
+		data = { radius = dynamicRadius, actualSize = numericSize }
+		self.vars.sphereSizes[mdl] = data
 	end
 
-	-- Return the stored data
-	return self:GetRadiusData( key )
+	return data.radius, data.actualSize
 end
 
 
@@ -1336,25 +1337,13 @@ end
 
 -- Returns if the given vehicle is valid, as we don't want the radar to detect boats, helicopters, or planes!
 function RADAR:IsVehicleValid( veh )
-	-- Get the model of the vehicle
 	local mdl = GetEntityModel( veh )
-
-	-- Create a key based on the model
-	local key = tostring( mdl )
-
-	-- Check if the vehicle model is valid
-	local valid = self:GetVehicleValidity( key )
+	local valid = self.vars.validVehicles[mdl]
 
 	-- If the validity value hasn't been set for the vehicle model, then we do it now
 	if ( valid == nil ) then
-		-- If the model is not what we want, then set the validity to false
-		if ( IsThisModelABoat( mdl ) or IsThisModelAHeli( mdl ) or IsThisModelAPlane( mdl ) ) then
-			self:SetVehicleValidity( key, false )
-			return false
-		else
-			self:SetVehicleValidity( key, true )
-			return true
-		end
+		valid = not ( IsThisModelABoat( mdl ) or IsThisModelAHeli( mdl ) or IsThisModelAPlane( mdl ) )
+		self.vars.validVehicles[mdl] = valid
 	end
 
 	return valid
@@ -1362,18 +1351,18 @@ end
 
 -- Gathers all of the vehicles in the local area of the player
 function RADAR:GetAllVehicles()
-	-- Create a temporary table
-	local t = {}
+	local t, n = {}, 0
+	local pool = GetGamePool( "CVehicle" )
 
-	-- Iterate through vehicles
-	for v in UTIL:EnumerateVehicles() do
+	for i = 1, #pool do
+		local v = pool[i]
+
 		if ( self:IsVehicleValid( v ) ) then
-			-- Insert the vehicle id into the temporary table
-			table.insert( t, v )
+			n = n + 1
+			t[n] = v
 		end
 	end
 
-	-- Return the table
 	return t
 end
 
@@ -1402,7 +1391,7 @@ function RADAR:GetVehiclesForAntenna()
 	-- Loop through and split up the vehicles based on front and rear, this is simply because the actual system
 	-- that gets all of the vehicles hit by the radar only has a relative position of either 1 or -1, which we
 	-- then convert below into an antenna string!
-	for ant in UTIL:Values( { "front", "rear" } ) do
+	for _, ant in ipairs( UTIL.ANTS ) do
 		-- Check that the antenna is actually transmitting
 		if ( self:IsAntennaTransmitting( ant ) ) then
 			-- Iterate through the captured vehicles
@@ -1426,7 +1415,7 @@ function RADAR:GetVehiclesForAntenna()
 
 	-- Now that we have all of the vehicles split into front and rear, we can iterate through both sets and get
 	-- the strongest and fastest vehicle for display
-	for ant in UTIL:Values( { "front", "rear" } ) do
+	for _, ant in ipairs( UTIL.ANTS ) do
 		-- Check that the table for the current antenna is not empty
 		if ( not UTIL:IsTableEmpty( vehs[ant] ) ) then
 			-- Get the 'strongest' vehicle for the antenna
@@ -1616,55 +1605,38 @@ function RADAR:RunDynamicThreadWaitCheck()
 end
 
 -- Create the thread that will run the dynamic thread wait check, this check only runs every two seconds
-Citizen.CreateThread( function()
+CreateThread( function()
 	while ( true ) do
 		-- Run the function
 		RADAR:RunDynamicThreadWaitCheck()
 
 		-- Make the thread wait two seconds
-		Citizen.Wait( 2000 )
+		Wait( 2000 )
 	end
 end )
 
 -- This function handles the custom ray trace system that is used to gather all of the vehicles hit by
 -- the ray traces defined in RADAR.rayTraces.
 function RADAR:RunThreads()
-	-- For the system to even run, the player needs to be sat in the driver's seat of a class 18 vehicle, the
-	-- radar has to be visible and the power must be on, and either one of the antennas must be enabled.
+	-- For the system to even run, the player needs to be sat in a class 18 vehicle, the radar has to be visible and
+	-- the power must be on, and either one of the antennas must be enabled.
 	if ( PLY:CanViewRadar() and self:CanPerformMainTask() and self:IsEitherAntennaOn() ) then
-		-- Before we create any of the custom ray trace threads, we need to make sure that the ray trace state
-		-- is at zero, if it is not at zero, then it means the system is still currently tracing
-		if ( self:GetRayTraceState() == 0 ) then
-			-- Grab a copy of the vehicle pool
-			local vehs = self:GetVehiclePool()
+		-- The scan is fully synchronous, so there's no need for the old per-frame ray trace state machine
+		self:ResetCapturedVehicles()
+		self:CreateRayThreads( PLY.veh, self:GetVehiclePool() )
 
-			-- Reset the main captured vehicles table
-			self:ResetCapturedVehicles()
-
-			-- Here we run the function that creates all of the main ray threads
-			self:CreateRayThreads( PLY.veh, vehs )
-
-			-- Make the thread this function runs in wait the dynamic time defined by the system
-			Citizen.Wait( self:GetThreadWaitTime() )
-
-		-- If the current ray trace state is the same as the total number of rays, then we reset the ray trace
-		-- state back to 0 so the thread system can run again
-		elseif ( self:GetRayTraceState() == self:GetNumOfRays() ) then
-			-- Reset the ray trace state to 0
-			self:ResetRayTraceState()
-		end
+		-- Wait the dynamic time defined by the system
+		return self:GetThreadWaitTime()
 	end
+
+	-- Radar is off or not usable, poll slowly instead of every frame
+	return 250
 end
 
--- Create the main thread that will run the threads function, the function itself is run every frame as the
--- dynamic wait time is ran inside the function
-Citizen.CreateThread( function()
+-- Create the main thread that will run the scan, the wait time is returned by the function itself
+CreateThread( function()
 	while ( true ) do
-		-- Run the function
-		RADAR:RunThreads()
-
-		-- Make the thread wait 0 ms
-		Citizen.Wait( 0 )
+		Wait( RADAR:RunThreads() )
 	end
 end )
 
@@ -1676,6 +1648,9 @@ function RADAR:Main()
 	if ( PLY:CanViewRadar() and self:CanPerformMainTask() ) then
 		-- Create a table that will be used to store all of the data to be sent to the NUI side
 		local data = {}
+
+		-- Heading of the patrol vehicle, rounded once per update instead of once per target
+		local ownH = UTIL:Round( GetEntityHeading( PLY.veh ), 0 )
 
 		-- Get the player's vehicle speed
 		local entSpeed = GetEntitySpeed( PLY.veh )
@@ -1698,7 +1673,7 @@ function RADAR:Main()
 		data.antennas = { ["front"] = nil, ["rear"] = nil }
 
 		-- Iterate through the front and rear data and obtain the information to be displayed
-		for ant in UTIL:Values( { "front", "rear" } ) do
+		for _, ant in ipairs( UTIL.ANTS ) do
 			-- Check that the antenna is actually transmitting, no point in running all the checks below if the antenna is off
 			if ( self:IsAntennaTransmitting( ant ) ) then
 				-- Create a table for the current antenna to store the information
@@ -1730,7 +1705,6 @@ function RADAR:Main()
 							data.antennas[ant][i].speed = UTIL:FormatSpeed( convertedSpeed )
 
 							-- Work out if the vehicle is closing or away
-							local ownH = UTIL:Round( GetEntityHeading( PLY.veh ), 0 )
 							local tarH = UTIL:Round( GetEntityHeading( av[ant][i].veh ), 0 )
 							data.antennas[ant][i].dir = UTIL:GetEntityRelativeDirection( ownH, tarH )
 
@@ -1767,12 +1741,29 @@ function RADAR:Main()
 		end
 
 		-- Send the update to the NUI side
-		SendNUIMessage( { _type = "update", speed = data.patrolSpeed, antennas = data.antennas } )
+		-- Only send it if something visible changed (or once a second as a heartbeat)
+		local sig = tostring( data.patrolSpeed )
+
+		for _, ant in ipairs( UTIL.ANTS ) do
+			local a = data.antennas[ant]
+
+			if ( a ~= nil ) then
+				sig = string.format( "%s|%s:%s,%s,%s,%s", sig, ant, a[1].speed, a[1].dir, a[2].speed, a[2].dir )
+			end
+		end
+
+		local now = GetGameTimer()
+
+		if ( sig ~= lastUpdateSig or now - lastUpdateTime > 1000 ) then
+			RawSendNUIMessage( { _type = "update", speed = data.patrolSpeed, antennas = data.antennas } )
+			lastUpdateSig = sig
+			lastUpdateTime = now
+		end
 	end
 end
 
 -- Main thread
-Citizen.CreateThread( function()
+CreateThread( function()
 	-- Remove the NUI focus just in case
 	SetNuiFocus( false, false )
 
@@ -1791,7 +1782,7 @@ Citizen.CreateThread( function()
 	RegisterKeyBinds()
 
 	-- Wait a short period of time
-	Citizen.Wait( 1000 )
+	Wait( 1000 )
 
 	-- Load the saved UI settings (if available)
 	LoadUISettings()
@@ -1806,7 +1797,7 @@ Citizen.CreateThread( function()
 	while ( true ) do
 		RADAR:Main()
 
-		Citizen.Wait( 100 )
+		Wait( 100 )
 	end
 end )
 
@@ -1824,15 +1815,15 @@ function RADAR:RunDisplayValidationCheck()
 end
 
 -- Runs the display validation check for the radar
-Citizen.CreateThread( function()
-	Citizen.Wait( 100 )
+CreateThread( function()
+	Wait( 100 )
 
 	while ( true ) do
 		-- Run the check
 		RADAR:RunDisplayValidationCheck()
 
 		-- Wait half a second
-		Citizen.Wait( 500 )
+		Wait( 500 )
 	end
 end )
 
@@ -1849,12 +1840,12 @@ function RADAR:UpdateVehiclePool()
 end
 
 -- Runs the vehicle pool updater
-Citizen.CreateThread( function()
+CreateThread( function()
 	while ( true ) do
 		-- Update the vehicle pool
 		RADAR:UpdateVehiclePool()
 
 		-- Wait 3 seconds
-		Citizen.Wait( 3000 )
+		Wait( 3000 )
 	end
 end )

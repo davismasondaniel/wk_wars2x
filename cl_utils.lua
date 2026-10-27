@@ -32,9 +32,17 @@
 
 UTIL = {}
 
+-- Shared antenna/camera key order, used instead of allocating a new table + iterator on every call
+UTIL.ANTS = { "front", "rear" }
+
 -- Returns a number to a set number of decimal places
 function UTIL:Round( num, numDecimalPlaces )
-	return tonumber( string.format( "%." .. ( numDecimalPlaces or 0 ) .. "f", num ) )
+	-- Fast path for whole numbers, no string formatting needed (math.floor returns an integer)
+	if ( not numDecimalPlaces or numDecimalPlaces == 0 ) then
+		return math.floor( num + 0.5 )
+	end
+
+	return tonumber( string.format( "%." .. numDecimalPlaces .. "f", num ) )
 end
 
 -- The custom font used for the digital displays have the ¦ symbol as an empty character, this function
@@ -43,14 +51,9 @@ function UTIL:FormatSpeed( speed )
 	-- Return "Err" (Error) if the given speed is outside the 0-999 range
 	if ( speed < 0 or speed > 999 ) then return "Err" end
 
-	-- Convert the speed to a string
+	-- Convert the speed to a string and pad it with pipes (¦) up to 3 characters
 	local text = tostring( speed )
-	local pipes = ""
-
-	-- Create a string of pipes (¦) for the number of spaces
-	for i = 1, 3 - string.len( text ) do
-		pipes = pipes .. "¦"
-	end
+	local pipes = string.rep( "¦", 3 - string.len( text ) )
 
 	-- Return the formatted speed
 	return pipes .. text
@@ -72,11 +75,7 @@ end
 
 -- Returns if the given table is empty, includes numerical and non-numerical key values
 function UTIL:IsTableEmpty( t )
-	local c = 0
-
-	for _ in pairs( t ) do c = c + 1 end
-
-	return c == 0
+	return next( t ) == nil
 end
 
 -- Credit to Deltanic for this function

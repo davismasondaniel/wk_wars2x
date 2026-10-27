@@ -519,17 +519,26 @@ function radarPower( state, override, fastDisplay )
 /*------------------------------------------------------------------------------------
 	Audio 
 ------------------------------------------------------------------------------------*/
+// Audio elements are created once per sound and cloned for playback, instead of building a new Audio object
+// (and re-requesting the file) every time a sound plays
+const audioCache = {};
+
 // Plays the given audio file name from the audioNames list at the given volume 
 function playAudio( name, vol )
 {
-	// Create the new audio object
-	let audio = new Audio( "sounds/" + audioNames[name] );
-	
-	// Set the volume 
+	let base = audioCache[name];
+
+	if ( !base ) {
+		base = new Audio( "sounds/" + audioNames[name] );
+		base.preload = "auto";
+		audioCache[name] = base;
+	}
+
+	let audio = base.cloneNode();
 	audio.volume = vol; 
 	
-	// Play the audio clip 
-	audio.play();
+	let p = audio.play();
+	if ( p && p.catch ) p.catch( function() {} );
 }
 
 // Plays the verbal lock, this is a separate from the function above as it plays two sounds with a delay
@@ -552,10 +561,19 @@ function playLockAudio( ant, dir, vol )
 	Radar updating  
 ------------------------------------------------------------------------------------*/
 // Updates patrol speed as well as the speeds and directional arrows for the given antenna
+// Only touches the DOM if the text actually changed
+function setText( ele, val )
+{
+	let n = ele[0];
+	val = String( val );
+
+	if ( n.textContent !== val ) n.textContent = val;
+}
+
 function updateDisplays( ps, ants )
 {
 	// Update the patrol speed
-	elements.patrolSpeed.html( ps );
+	setText( elements.patrolSpeed, ps );
 
 	// Iterate through the antenna data 
 	for ( let ant in ants ) 
@@ -566,8 +584,8 @@ function updateDisplays( ps, ants )
 			let e = elements.antennas[ant]; 
 
 			// Update the target and fast speeds
-			e.targetSpeed.html( ants[ant][0].speed ); 
-			e.fastSpeed.html( ants[ant][1].speed ); 
+			setText( e.targetSpeed, ants[ant][0].speed ); 
+			setText( e.fastSpeed, ants[ant][1].speed ); 
 
 			// Update the directional arrows
 			setAntennaDirs( ant, ants[ant][0].dir, ants[ant][1].dir );
